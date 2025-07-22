@@ -110,9 +110,6 @@ if __name__ == "__main__":
 
     #Salvar em um arquivo .csv
     df_spark.write.csv("ibov_14_07")
-
-
-
     
     # 4. Salvar os dados processados em um arquivo Parquet
     if df_spark.count() > 0:
