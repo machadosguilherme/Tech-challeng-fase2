@@ -1,105 +1,55 @@
 import base64
 import json
+from datetime import date, datetime
 import requests
-import pandas as pd
-from datetime import date
 
-def generate_historical_json_url(target_date):
+# Imports específicos do PySpark
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit, current_date, date_format, regexp_replace, trim, to_date
+from pyspark.sql.types import StructType, StructField, StringType, FloatType, LongType, DateType
+
+def transform_data(spark):
     """
-    Gera a URL para buscar a carteira em JSON de uma data específica (histórico).
-    Esta é a única rota que respeita a data.
+    Transforma os dados extraídos da API da B3 usando PySpark.
+    Esta função assume que os dados já foram extraídos e estão disponíveis em um DataFrame PySpark.
     """
-    base_url = "https://sistemaswebb3-listados.b3.com.br/indexProxy/indexCall/GetPortfolioDayByDate/"
 
-    params = {
-        "language": "pt-br",
-        "pageNumber": 1,
-        "pageSize": 150, # Suficiente para buscar todos os ativos do IBOV
-        "index": "IBOV",
-        "segment": "1",
-        "refDate": target_date.strftime('%Y-%m-%d')
-    }
-    
-    json_params = json.dumps(params, separators=(',', ':'))
-    base64_params = base64.b64encode(json_params.encode('utf-8')).decode('utf-8')
-    return f"{base_url}{base64_params}"
+    raw_data_path = "./data/raw"
+    df = spark.read.parquet(raw_data_path)
 
-def fetch_and_save_as_csv(url, save_path):
-    """
-    Busca os dados JSON da URL, converte para um DataFrame Pandas e salva como CSV.
-    """
-    print(f"Buscando dados da URL: {url}")
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+    if df.rdd.isEmpty():
+        print("Alerta: DataFrame vazio. Retornando DataFrame vazio.")
+        return spark.createDataFrame([], schema="data_referencia date, ticker string, nome_ativo string, tipo_ativo string, quantidade_teorica long, participacao_percentual float")
 
-    try:
-        res = requests.get(url, headers=headers, timeout=20)
 
-        if res.status_code == 200:
-            data = res.json()
-            
-            if 'results' in data and data['results']:
-                print(f"Sucesso! Dados recebidos para a data: {data['header']['date']}")
-                
-                # 1. Converter a lista 'results' do JSON em um DataFrame
-                df = pd.DataFrame(data['results'])
-                
-                # 2. Limpar e transformar os dados
-                df['data_referencia'] = pd.to_datetime(data['header']['date'], format='%d/%m/%y').date
-                
-                df.rename(columns={
-                    'cod': 'ticker',
-                    'asset': 'nome_ativo',
-                    'type': 'tipo_ativo',
-                    'part': 'participacao_percentual',
-                    'theoricalQty': 'quantidade_teorica'
-                }, inplace=True)
-                
-                # Conversão de tipos e limpeza de strings
-                df['tipo_ativo'] = df['tipo_ativo'].str.strip()
-                df['quantidade_teorica'] = df['quantidade_teorica'].str.replace('.', '', regex=False).astype('int64')
-                df['participacao_percentual'] = df['participacao_percentual'].str.replace(',', '.', regex=False).astype('float64')
-                
-                # 3. Reordenar colunas para o formato final
-                df_final = df[[
-                    'data_referencia',
-                    'ticker',
-                    'nome_ativo',
-                    'tipo_ativo',
-                    'quantidade_teorica',
-                    'participacao_percentual'
-                ]]
+    # Carrega os dados da camada RAW que você acabou de salvar
+    df_raw = spark.read.parquet("./data/raw")
 
-                # 4. Salvar o DataFrame limpo em um arquivo CSV
-                df_final.to_csv(
-                    save_path,
-                    sep=';',           # Separador ponto e vírgula, comum no Brasil
-                    index=False,       # Não salvar o índice do DataFrame no arquivo
-                    encoding='utf-8-sig' # Codificação que funciona bem com acentos e no Excel
-                )
-                print(f"Arquivo CSV salvo com sucesso em: {save_path}")
-                print("\nAmostra dos dados salvos:")
-                print(df_final.head())
+    # Transforma os dados brutos em uma tabela limpa
+    df_transformed = df_raw.select(
+        to_date(col("header_date"), "dd/MM/yy").alias("data_referencia"),
+        col("cod").alias("ticker"),
+        col("asset").alias("nome_ativo"),
+        trim(col("type")).alias("tipo_ativo"),
+        regexp_replace(col("part"), ',', '.').cast(FloatType()).alias("participacao_percentual"),
+        regexp_replace(col("theoricalQty"), '\\.', '').cast(LongType()).alias("quantidade_teorica")
+    )
 
-            else:
-                print(f"FALHA: A API respondeu, mas não retornou resultados. Pode ser um feriado ou dia sem pregão.")
-        else:
-            print(f"FALHA: A API retornou um erro. Status: {res.status_code}")
+    #Coluna de data de processamento
+    df_transformed = df_transformed.withColumn("dataproc", date_format(current_date(), 'yyyyMMdd').cast("int"))
+    df_transformed
 
-    except requests.exceptions.RequestException as e:
-        print(f"Erro de conexão: {e}")
+    # Salva a tabela limpa na camada "transformed"
+    transformed_data_path = "./data/transformed"
+    df_transformed.write.mode("overwrite").parquet(transformed_data_path)
 
-# --- EXECUÇÃO ---
+    # Visualiza o resultado final e limpo
+    print("Tabela final e limpa da camada 'Transformed':")
+    df_transformed.show()
 
-# Escolha uma data passada que com certeza foi um dia útil
-target_day = date(2025, 7, 1) # Sexta-feira, 11 de Julho de 2025
+if __name__ == "__main__":
+    # 1. Criar uma sessão Spark
+    spark = SparkSession.builder.appName("B3_IBOV_ETL").getOrCreate()
+    df_spark = transform_data(spark)
 
-# Gera a URL correta (para o endpoint JSON)
-historical_url = generate_historical_json_url(target_day)
 
-# Define o nome do arquivo CSV de saída
-output_csv_file = f"IBOV_carteira_{target_day.strftime('%Y-%m-%d')}.csv"
-
-# Executa o processo completo
-fetch_and_save_as_csv(historical_url, output_csv_file)
